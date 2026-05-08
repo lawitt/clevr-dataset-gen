@@ -89,6 +89,8 @@ parser.add_argument('--start_idx', default=0, type=int,
          "multiple machines and recombine the results later.")
 parser.add_argument('--num_images', default=5, type=int,
     help="The number of images to render")
+parser.add_argument('--num_viewpoints', default=6, type=int,
+    help="The number of viewpoints per image to render")
 parser.add_argument('--filename_prefix', default='CLEVR',
     help="This prefix will be prepended to the rendered images and JSON scenes")
 parser.add_argument('--split', default='new',
@@ -171,21 +173,29 @@ def main(args):
   
   all_scene_paths = []
   for i in range(args.num_images):
-    img_path = img_template % (i + args.start_idx)
-    scene_path = scene_template % (i + args.start_idx)
-    all_scene_paths.append(scene_path)
-    blend_path = None
-    if args.save_blendfiles == 1:
-      blend_path = blend_template % (i + args.start_idx)
+    scene_idx = i + args.start_idx
+    
+    random.seed(scene_idx)    
     num_objects = random.randint(args.min_objects, args.max_objects)
-    render_scene(args,
-      num_objects=num_objects,
-      output_index=(i + args.start_idx),
-      output_split=args.split,
-      output_image=img_path,
-      output_scene=scene_path,
-      output_blendfile=blend_path,
-    )
+    fixed_objects = generate_scene_objects(args, scene_idx, num_objects)
+    
+    for v in range(args.num_viewpoints):
+      view_suffix = "_view_%d" % v
+      img_path = (img_template % scene_idx).replace('.png', view_suffix + '.png')
+      scene_path = (scene_template % scene_idx).replace('.json', view_suffix + '.json')
+      blend_path = (blend_template % scene_idx).replace('.blend', view_suffix + '.blend') if args.save_blendfiles else None
+      
+      all_scene_paths.append(scene_path)
+      render_scene(args,
+        num_objects=num_objects,
+        output_index=scene_idx,
+        output_split=args.split,
+        output_image=img_path,
+        output_scene=scene_path,
+        view_idx=v,
+        total_views=args.num_viewpoints,
+        fixed_objects=fixed_objects
+      )
 
   # After rendering all images, combine the JSON files for each scene into a
   # single JSON file.
@@ -204,7 +214,97 @@ def main(args):
   }
   with open(args.output_scene_file, 'w') as f:
     json.dump(output, f)
-
+    
+    
+def generate_scene_objects(args, scene_idx, num_objects):
+  random.seed(scene_idx)
+  
+  with open(args.properties_json, 'r') as f:
+    properties = json.load(f)
+    color_name_to_rgba = {}
+    for name, rgb in properties['colors'].items():
+      rgba = [float(c) / 255.0 for c in rgb] + [1.0]
+      color_name_to_rgba[name] = rgba
+    material_mapping = [(v, k) for k, v in properties['materials'].items()]
+    object_mapping = [(v, k) for k, v in properties['shapes'].items()]
+    size_mapping = list(properties['sizes'].items())
+    
+    shape_color_combos = None
+    if args.shape_color_combos_json is not None:
+      with open(args.shape_color_combos_json, 'r') as f:
+        shape_color_combos = list(json.load(f).items())
+        
+    positions = []
+    objects = []
+    
+    cardinal_dirs = [(1, 0), (-1, 0), (0, 1), (0, -1)]
+    
+    attempts = 0
+    while len(objects) < num_objects:
+      attempts += 1
+      if attempts > args.max_retries * num_objects:
+        return generate_scene_objects.__wrapped__(args, scene_idx, num_objects)
+      
+      size_name, r = random.choice(size_mapping)
+      x = random.uniform(-3, 3)
+      y = random.uniform(-3, 3)
+      
+      dists_good = True
+      margins_good = True
+      for (xx, yy, rr) in positions:
+        dx, dy = x - xx, y - yy
+        dist = math.sqrt(dx * dx + dy * dy)
+        if dist - r - rr < args.min_dist:
+          dists_good = False
+          break
+        for (dvx, dvy) in cardinal_dirs:
+          margin = dx * dvx + dy * dvy
+          if 0 < margin < args.margin:
+            margins_good = False
+            break
+        if not margins_good:
+          break
+        
+      if not (dists_good and margins_good):
+        continue
+      
+      if shape_color_combos is None:
+        obj_name, obj_name_out = random.choice(object_mapping)
+        color_name, rgba = random.choice(list(color_name_to_rgba.items()))
+      else:
+        obj_name_out, color_choices = random.choice(shape_color_combos)
+        color_name = random.choice(color_choices)
+        obj_name = [k for k, v in object_mapping if v == obj_name_out][0]
+        rgba = color_name_to_rgba[color_name]
+        
+      actual_r = r / math.sqrt(2) if obj_name == 'Cube' else r
+      theta = 360.0 * random.random()
+      mat_name, mat_name_out = random.choice(material_mapping)
+      
+      positions.append((x, y, actual_r))
+      objects.append({
+        'obj_name': obj_name,
+        'obj_name_out': obj_name_out,
+        'size_name': size_name,
+        'r': r,
+        'x': x,
+        'y': y,
+        'color_name': color_name,
+        'rgba': rgba,
+        'mat_name': mat_name,
+        'mat_name_out': mat_name_out,
+        'theta': theta,
+      })
+      
+  return objects
+  
+generate_scene_objects.__wrapped__ = generate_scene_objects
+    
+def look_at(obj, target):
+  # calculates the rotation needed for the camera to face the center
+  direction = target - obj.location
+  rot_quat = direction.to_track_quat('-Z', 'Y')
+  obj.rotation_euler = rot_quat.to_euler()
 
 
 def render_scene(args,
@@ -214,6 +314,9 @@ def render_scene(args,
     output_image='render.png',
     output_scene='render_json',
     output_blendfile=None,
+    view_idx=0,
+    total_views=1,
+    fixed_objects=None
   ):
 
   # Load the main blendfile
@@ -261,20 +364,36 @@ def render_scene(args,
   }
 
   # Put a plane on the ground so we can compute cardinal directions
-  bpy.ops.mesh.primitive_plane_add(radius=5)
+  bpy.ops.mesh.primitive_plane_add(radius=100)
+  bpy.context.scene.world.use_nodes = False
+  bpy.context.scene.world.horizon_color = (1, 1, 1)
+  bpy.context.scene.world.zenith_color = (1, 1, 1)
+  bpy.context.scene.world.use_sky_blend = False
+  bpy.context.scene.world.use_sky_paper = True
   plane = bpy.context.object
 
   def rand(L):
     return 2.0 * L * (random.random() - 0.5)
 
   # Add random jitter to camera position
-  if args.camera_jitter > 0:
-    for i in range(3):
-      bpy.data.objects['Camera'].location[i] += rand(args.camera_jitter)
+  # if args.camera_jitter > 0:
+  #   for i in range(3):
+  #     bpy.data.objects['Camera'].location[i] += rand(args.camera_jitter)
+  
+  
 
   # Figure out the left, up, and behind directions along the plane and record
   # them in the scene structure
   camera = bpy.data.objects['Camera']
+  
+  r = 12.0
+  angle = (2 * math.pi / total_views) * view_idx
+  camera.location[0] = r * math.cos(angle)
+  camera.location[1] = r * math.sin(angle)
+  camera.location[2] = 4.0  # fixed height for the camera
+  
+  look_at(camera, Vector((0, 0, 0)))
+  
   plane_normal = plane.data.vertices[0].normal
   cam_behind = camera.matrix_world.to_quaternion() * Vector((0, 0, -1))
   cam_left = camera.matrix_world.to_quaternion() * Vector((-1, 0, 0))
@@ -294,8 +413,11 @@ def render_scene(args,
   scene_struct['directions']['right'] = tuple(-plane_left)
   scene_struct['directions']['above'] = tuple(plane_up)
   scene_struct['directions']['below'] = tuple(-plane_up)
+  
+  scene_struct['camera_position'] = tuple(camera.location)
 
   # Add random jitter to lamp positions
+  random.seed(output_index)  # ensure that jitter is consistent across views of the same scene
   if args.key_light_jitter > 0:
     for i in range(3):
       bpy.data.objects['Lamp_Key'].location[i] += rand(args.key_light_jitter)
@@ -307,7 +429,11 @@ def render_scene(args,
       bpy.data.objects['Lamp_Fill'].location[i] += rand(args.fill_light_jitter)
 
   # Now make some random objects
-  objects, blender_objects = add_random_objects(scene_struct, num_objects, args, camera)
+  if fixed_objects is not None:
+    objects, blender_objects = add_fixed_objects(scene_struct, fixed_objects, args, camera)
+  else:
+    random.seed(output_index)  # ensure that objects are the same across views of the same scene
+    objects, blender_objects = add_random_objects(scene_struct, num_objects, args, camera)
 
   # Render the scene and dump the scene data structure
   scene_struct['objects'] = objects
@@ -324,6 +450,34 @@ def render_scene(args,
 
   if output_blendfile is not None:
     bpy.ops.wm.save_as_mainfile(filepath=output_blendfile)
+    
+def add_fixed_objects(scene_struct, fixed_objects, args, camera):
+  objects = []
+  blender_objects = []
+  
+  for spec in fixed_objects:
+    utils.add_object(args.shape_dir, spec['obj_name'], spec['r'], (spec['x'], spec['y']), theta=spec['theta'])
+    obj = bpy.context.object
+    blender_objects.append(obj)
+    
+    utils.add_material(spec['mat_name'], Color=spec['rgba'])
+    
+    pixel_coords = utils.get_camera_coords(camera, obj.location)
+    objects.append({
+      'shape': spec['obj_name_out'],
+      'size': spec['size_name'],
+      'material': spec['mat_name_out'],
+      '3d_coords': tuple(obj.location),
+      'rotation': spec['theta'],
+      'pixel_coords': pixel_coords,
+      'color': spec['color_name'],
+    })
+    
+    all_visible = check_visibility(blender_objects, args.min_pixels_per_object)
+    if not all_visible:
+      print("Some objetcs are occluded in views")
+      
+  return objects, blender_objects
 
 
 def add_random_objects(scene_struct, num_objects, args, camera):
